@@ -1,241 +1,221 @@
 <script setup>
-// VueのComposition APIから必要な関数をインポート
-import { ref, onMounted, onUnmounted } from 'vue'
-// SkyWay SDKの主要クラス・関数をインポート
-import { SkyWayContext, SkyWayRoom, SkyWayStreamFactory, uuidV4 } from '@skyway-sdk/room'
-// 旧: トークン取得関数（本番ではサーバー経由推奨） GetToken を直接呼んでいたが、動的更新対応の fetchSkywayToken に変更
-// import GetToken from '../../api/skyway-token.js'
-import { fetchSkywayToken } from '../services/skywayTokenClient.js' // 相対パス要確認: src/components -> src/services
+import { ref, onMounted, onUnmounted } from 'vue';
+import { SkyWayContext, SkyWayRoom, SkyWayStreamFactory, uuidV4 } from '@skyway-sdk/room';
+import { fetchSkywayToken } from '../services/skywayTokenClient.js';
 
-// --- 設定値・状態管理 ---
-// FIXME: 秘密鍵はフロントに置かないこと（学習用の一時対応）
-// const tokenString = GetToken(import.meta.env.VITE_SKYWAY_APP_ID, import.meta.env.VITE_SKYWAY_SECRET_KEY)  // ← 動的取得方式へ置換
+// SkyWay関連
+const ctx = ref(null);
+const room = ref(null);
+const member = ref(null);
 
-// SkyWay関連のインスタンス
-const ctx = ref(null)      // SkyWayContext
-const room = ref(null)     // SkyWayRoom
-const member = ref(null)   // 参加メンバー
-
-// UI・状態管理用
-const baseUrl = window.location.href.split('?')[0] // ルームURLのベース
-const StreamArea = ref(null)                       // 映像・音声表示エリア
-const RoomCreated = ref(false)                     // ルーム作成済みフラグ
-const RoomId = ref(null)                           // ルームID
-const isJoining = ref(false)                       // 参加中フラグ
-const errorMessage = ref('')                       // エラーメッセージ
+// 状態
+const StreamArea = ref(null);
+const RoomCreated = ref(false);
+const RoomId = ref(null);
+const isJoining = ref(false);
+const errorMessage = ref('');
 const tokenRef = ref(null);
-// ローカルメディア関連
-const localVideoEl = ref(null)     // ローカル映像要素
-const localVideoStream = ref(null) // ローカル映像ストリーム
-const localAudioStream = ref(null) // ローカル音声ストリーム
 
-// ログ出力用
-function log(...args){
-  console.log('[SkyWay]', ...args)
+// ローカルメディア
+const localVideoEl = ref(null);
+const localVideoStream = ref(null);
+const localAudioStream = ref(null);
+
+// 管理用
+const mediaElements = new Map(); // pubId -> { el, stream }
+
+// URL ベース (表示用)
+const baseUrl = window.location.href.split('?')[0];
+
+function log(...a) {
+  console.log('[SkyWay]', ...a);
 }
 
-// --- SkyWayContextの取得・初期化 ---
-// トークン更新リマインダーも設定
-async function getContext(){
-  if(ctx.value) return ctx.value;
-  // 追加: RoomId がまだなら URL パラメータから取得（トークン取得前に確定させる）
-  if(!RoomId.value){
-    RoomId.value = new URLSearchParams(window.location.search).get('room')
+// SkyWayContext 初期化
+async function getContext() {
+  if (ctx.value) return ctx.value;
+
+  if (!RoomId.value) {
+    RoomId.value = new URLSearchParams(location.search).get('room');
   }
-  // 動的にサーバー（想定）からトークン取得
+
   tokenRef.value = await fetchSkywayToken(RoomId.value);
   ctx.value = await SkyWayContext.Create(tokenRef.value);
+
   ctx.value.onTokenUpdateReminder.add(async () => {
-    // 強化: 例外捕捉 & ログ
-    try{
+    try {
       tokenRef.value = await fetchSkywayToken(RoomId.value);
       await ctx.value.updateAuthToken(tokenRef.value);
       log('Token refreshed');
-    }catch(e){
+    } catch (e) {
       console.error('Token refresh failed', e);
     }
   });
+
   return ctx.value;
 }
 
-// --- ルーム作成 ---
-// SFU型ルームを新規作成または取得
-const createRoom = async () => {
-  if (!RoomId.value) RoomId.value = uuidV4()
+// ルーム作成
+async function createRoom() {
+  if (!RoomId.value) RoomId.value = uuidV4();
   room.value = await SkyWayRoom.FindOrCreate(ctx.value, {
     type: 'sfu',
     name: RoomId.value
-  })
-  RoomCreated.value = true
-  setupRoomEvents(room.value)
+  });
+  RoomCreated.value = true;
+  setupRoomEvents(room.value);
 }
 
-// --- ルームイベントの設定 ---
-// 新規ストリーム公開・解除・メンバー離脱時の処理
-function setupRoomEvents(r){
-  // 新規ストリーム公開時
-  r.onStreamPublished.add(async e => {
-    log('onStreamPublished', e.publication.id)
-    trySubscribe(e.publication)
-  })
-  // ストリーム解除時
-  r.onStreamUnpublished.add(e => {
-    removeMediaElement(e.publication.id)
-  })
-  // メンバー離脱時
+// イベント設定
+function setupRoomEvents(r) {
+  r.onStreamPublished.add(e => trySubscribe(e.publication));
+  r.onStreamUnpublished.add(e => removeMedia(e.publication.id));
   r.onMemberLeft.add(e => {
-    e.member.publications?.forEach(p => removeMediaElement(p.id))
-  })
+    e.member.publications?.forEach(p => removeMedia(p.id));
+  });
 }
 
-// --- メディア要素管理 ---
-// pubId -> { el, stream } のMap
-const mediaElements = new Map()
-
-// メディア要素の削除
-function removeMediaElement(pubId){
-  const entry = mediaElements.get(pubId)
-  if (!entry) return
-  entry.stream?.detach(entry.el)
-  entry.el.remove()
-  mediaElements.delete(pubId)
-}
-
-// --- ストリーム購読処理 ---
-// 他メンバーの映像・音声を受信して表示
-async function trySubscribe(publication){
-  if (!member.value) return
-  if (publication.publisher.id === member.value.id) return // 自分自身は除外
-  if (!['video','audio'].includes(publication.contentType)) return
+// メディア削除
+function removeMedia(pubId) {
+  const entry = mediaElements.get(pubId);
+  if (!entry) return;
   try {
-    const { stream } = await member.value.subscribe(publication.id)
-    if (stream.track.kind === 'video'){
-      const el = document.createElement('video')
-      el.autoplay = true
-      el.playsInline = true
-      stream.attach(el)
-      StreamArea.value.appendChild(el)
-      mediaElements.set(publication.id, { el, stream })
-    } else if (stream.track.kind === 'audio'){
-      const el = document.createElement('audio')
-      el.autoplay = true
-      stream.attach(el)
-      StreamArea.value.appendChild(el)
-      mediaElements.set(publication.id, { el, stream })
+    entry.stream?.detach(entry.el);
+  } catch {}
+  entry.el.remove();
+  mediaElements.delete(pubId);
+}
+
+// 購読
+async function trySubscribe(publication) {
+  if (!member.value) return;
+  if (publication.publisher.id === member.value.id) return;
+  if (!['video', 'audio'].includes(publication.contentType)) return;
+  try {
+    const { stream } = await member.value.subscribe(publication.id);
+    let el;
+    if (stream.track.kind === 'video') {
+      el = document.createElement('video');
+      el.playsInline = true;
+      el.autoplay = true;
+    } else {
+      el = document.createElement('audio');
+      el.autoplay = true;
     }
-  } catch (e){
-    console.error('subscribe失敗', publication.id, e)
+    stream.attach(el);
+    StreamArea.value.appendChild(el);
+    mediaElements.set(publication.id, { el, stream });
+  } catch (e) {
+    console.warn('Subscribe failed', publication.id, e);
   }
 }
 
-// --- ルーム参加処理 ---
-// 既存ストリームの購読・ローカルメディアの公開
-const joinRoom = async () => {
-  if (isJoining.value) return
-  isJoining.value = true
-  errorMessage.value = ''
+// 参加
+async function joinRoom() {
+  if (isJoining.value) return;
+  isJoining.value = true;
+  errorMessage.value = '';
   try {
-    if (!RoomId.value){
-      alert('No Room ID')
-      return
+    if (!RoomId.value) {
+      alert('No Room ID');
+      return;
     }
-    await getContext()
-    if (!RoomCreated.value) await createRoom()
+    await getContext();
+    if (!RoomCreated.value) await createRoom();
 
-    // メンバーとして参加
-    if (!member.value){
-      member.value = await room.value.join({ name: uuidV4() })
-    }
-
-    // 既存の公開ストリームを一括購読
-    for (const pub of room.value.publications){
-      await trySubscribe(pub)
+    if (!member.value) {
+      member.value = await room.value.join({ name: uuidV4() });
     }
 
-    // ローカル映像・音声の生成と公開（初回のみ）
-    if (!localVideoStream.value){
-      const { audio, video } = await SkyWayStreamFactory.createMicrophoneAudioAndCameraStream()
-      localAudioStream.value = audio
-      localVideoStream.value = video
-      await member.value.publish(audio)
-      await member.value.publish(video)
-
-      // ローカル映像のプレビュー表示
-      localVideoEl.value = document.createElement('video')
-      localVideoEl.value.autoplay = true
-      localVideoEl.value.playsInline = true
-      localVideoEl.value.muted = true
-      localVideoEl.value.style.width = '100%'
-      localVideoEl.value.style.height = '100%'
-      video.attach(localVideoEl.value)
-      StreamArea.value.appendChild(localVideoEl.value)
-      // 追加: ローカル映像も統一管理
-      mediaElements.set('__local', { el: localVideoEl.value, stream: video })
+    // 既存 publication 購読
+    for (const pub of room.value.publications) {
+      await trySubscribe(pub);
     }
 
-  } catch (e){
-    console.error(e)
-    errorMessage.value = e.message
+    // ローカル publish (初回のみ)
+    if (!localVideoStream.value) {
+      const { audio, video } = await SkyWayStreamFactory.createMicrophoneAudioAndCameraStream();
+      localAudioStream.value = audio;
+      localVideoStream.value = video;
+      await member.value.publish(audio);
+      await member.value.publish(video);
+
+      localVideoEl.value = document.createElement('video');
+      localVideoEl.value.autoplay = true;
+      localVideoEl.value.playsInline = true;
+      localVideoEl.value.muted = true;
+      localVideoEl.value.style.width = '100%';
+      localVideoEl.value.style.height = '100%';
+      video.attach(localVideoEl.value);
+      StreamArea.value.appendChild(localVideoEl.value);
+      mediaElements.set('__local', { el: localVideoEl.value, stream: video });
+    }
+  } catch (e) {
+    console.error(e);
+    errorMessage.value = e.message;
   } finally {
-    isJoining.value = false
+    isJoining.value = false;
   }
 }
 
-// --- ライフサイクルフック ---
-// マウント時：コンテキスト初期化＆URLパラメータからルームID取得
 onMounted(async () => {
-  await getContext()
-  // getContext 内で未設定なら取得するが、明示的に再取得してもよい（冪等）
-  if(!RoomId.value){
-    RoomId.value = new URLSearchParams(window.location.search).get('room')
+  RoomId.value = new URLSearchParams(location.search).get('room');
+  // ここで直ちに context を作らなくても良いが、先に用意する場合:
+  try {
+    await getContext();
+  } catch (e) {
+    console.error('Context init failed', e);
+    errorMessage.value = e.message;
   }
-})
+});
 
-// アンマウント時：リソース解放・クリーンアップ
 onUnmounted(() => {
   try {
-    // ローカルトラック停止
-    localVideoStream.value?.track?.stop?.()
-    localAudioStream.value?.track?.stop?.()
-    // リモート要素解除
     mediaElements.forEach(({ el, stream }) => {
-      stream?.detach(el)
-      el.remove()
-    })
-    mediaElements.clear()
-    // ルーム離脱・インスタンス破棄
-    member.value?.leave?.()
-    room.value?.dispose?.()
-    ctx.value?.dispose?.()
-  } catch (e){
-    console.warn('cleanup error', e)
+      try { stream.detach(el); } catch {}
+      el.remove();
+    });
+    mediaElements.clear();
+    localVideoStream.value?.track?.stop?.();
+    localAudioStream.value?.track?.stop?.();
+    member.value?.leave?.();
+    room.value?.dispose?.();
+    ctx.value?.dispose?.();
+  } catch (e) {
+    console.warn('cleanup error', e);
   }
-})
+});
 </script>
 
 <template>
   <h1>Kaigi</h1>
-  <div class="card">
-    <!-- 映像・音声表示エリア -->
-    <div v-if="RoomCreated" ref="StreamArea"></div>
-    <!-- ルーム未作成時：作成ボタン表示 -->
-    <div v-else>
+  <div class="card" style="max-width:800px;">
+    <div v-if="RoomCreated" ref="StreamArea" style="display:grid; gap:12px;"></div>
+
+    <div v-else style="margin-bottom:1rem;">
       <button @click="createRoom" :disabled="isJoining">Create Room</button>
     </div>
 
-    <!-- ルームID・URL表示＆参加ボタン -->
     <div v-if="RoomId">
-      <p>以下のURLは相手とシェア:</p>
-      <p>{{ baseUrl }}?room={{ RoomId }}</p>
-      <p>またはルームID:</p>
-      <p>{{ RoomId }}</p>
-      <p>会議を開始するため以下:</p>
+      <p>共有用 URL:</p>
+      <p style="word-break:break-all;">{{ baseUrl }}?room={{ RoomId }}</p>
+      <p>Room ID: {{ RoomId }}</p>
       <button :disabled="isJoining" @click="joinRoom">
         {{ isJoining ? 'Joining...' : 'Join Room' }}
       </button>
     </div>
+    <div v-else>
+      <p>Room がまだありません。Create ボタンを押すか ?room=XXX を URL に付与してください。</p>
+    </div>
 
-    <!-- エラー表示 -->
-    <p v-if="errorMessage" style="color:red;">Error: {{ errorMessage }}</p>
+    <p v-if="errorMessage" style="color:red;white-space:pre-line;">Error: {{ errorMessage }}</p>
   </div>
 </template>
+
+<style scoped>
+.card button {
+  padding: 6px 14px;
+  font-size: 14px;
+  cursor: pointer;
+}
+</style>
