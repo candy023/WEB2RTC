@@ -3,12 +3,13 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 // SkyWay SDKの主要クラス・関数をインポート
 import { SkyWayContext, SkyWayRoom, SkyWayStreamFactory, uuidV4 } from '@skyway-sdk/room'
-// トークン取得関数（本番ではサーバー経由推奨）
-import GetToken from '../../api/SkywayToken.js'
+// 旧: トークン取得関数（本番ではサーバー経由推奨） GetToken を直接呼んでいたが、動的更新対応の fetchSkywayToken に変更
+// import GetToken from '../../api/skyway-token.js'
+import { fetchSkywayToken } from '../services/skywayTokenClient.js' // 相対パス要確認: src/components -> src/services
 
 // --- 設定値・状態管理 ---
 // FIXME: 秘密鍵はフロントに置かないこと（学習用の一時対応）
-const tokenString = GetToken(import.meta.env.VITE_SKYWAY_APP_ID, import.meta.env.VITE_SKYWAY_SECRET_KEY)
+// const tokenString = GetToken(import.meta.env.VITE_SKYWAY_APP_ID, import.meta.env.VITE_SKYWAY_SECRET_KEY)  // ← 動的取得方式へ置換
 
 // SkyWay関連のインスタンス
 const ctx = ref(null)      // SkyWayContext
@@ -35,14 +36,24 @@ function log(...args){
 
 // --- SkyWayContextの取得・初期化 ---
 // トークン更新リマインダーも設定
-
 async function getContext(){
   if(ctx.value) return ctx.value;
+  // 追加: RoomId がまだなら URL パラメータから取得（トークン取得前に確定させる）
+  if(!RoomId.value){
+    RoomId.value = new URLSearchParams(window.location.search).get('room')
+  }
+  // 動的にサーバー（想定）からトークン取得
   tokenRef.value = await fetchSkywayToken(RoomId.value);
   ctx.value = await SkyWayContext.Create(tokenRef.value);
   ctx.value.onTokenUpdateReminder.add(async () => {
-    tokenRef.value = await fetchSkywayToken(RoomId.value);
-    await ctx.value.updateAuthToken(tokenRef.value);
+    // 強化: 例外捕捉 & ログ
+    try{
+      tokenRef.value = await fetchSkywayToken(RoomId.value);
+      await ctx.value.updateAuthToken(tokenRef.value);
+      log('Token refreshed');
+    }catch(e){
+      console.error('Token refresh failed', e);
+    }
   });
   return ctx.value;
 }
@@ -158,6 +169,8 @@ const joinRoom = async () => {
       localVideoEl.value.style.height = '100%'
       video.attach(localVideoEl.value)
       StreamArea.value.appendChild(localVideoEl.value)
+      // 追加: ローカル映像も統一管理
+      mediaElements.set('__local', { el: localVideoEl.value, stream: video })
     }
 
   } catch (e){
@@ -172,7 +185,10 @@ const joinRoom = async () => {
 // マウント時：コンテキスト初期化＆URLパラメータからルームID取得
 onMounted(async () => {
   await getContext()
-  RoomId.value = new URLSearchParams(window.location.search).get('room')
+  // getContext 内で未設定なら取得するが、明示的に再取得してもよい（冪等）
+  if(!RoomId.value){
+    RoomId.value = new URLSearchParams(window.location.search).get('room')
+  }
 })
 
 // アンマウント時：リソース解放・クリーンアップ
@@ -204,7 +220,7 @@ onUnmounted(() => {
     <div v-if="RoomCreated" ref="StreamArea"></div>
     <!-- ルーム未作成時：作成ボタン表示 -->
     <div v-else>
-      <button @click="createRoom">Create Room</button>
+      <button @click="createRoom" :disabled="isJoining">Create Room</button>
     </div>
 
     <!-- ルームID・URL表示＆参加ボタン -->
