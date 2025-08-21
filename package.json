@@ -11,6 +11,7 @@
   "dependencies": {
     "@skyway-sdk/core": "^1.15.0",
     "@skyway-sdk/room": "^1.15.1",
+    "uuidv4": "^6.2.13",
     "vue": "^3.5.18"
   },
   "devDependencies": {
